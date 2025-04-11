@@ -1,0 +1,19 @@
+# ROS 2 build artifacts
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Misc
+*.swp
+*.log
+
+# VSCode settings
+.vscode/
+
+# Environment files
+.env
+
