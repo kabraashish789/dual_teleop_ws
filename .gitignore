@@ -5,15 +5,24 @@ log/
 
 # Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+*.egg
+*.pyo
+*.pyd
 
-# Misc
-*.swp
+# Test and coverage
+.cache/
+.coverage
+htmlcov/
 *.log
 
-# VSCode settings
+# IDE/editor/project files
 .vscode/
+.idea/
+*.swp
+*.swo
 
-# Environment files
+# Env/config
 .env
 
