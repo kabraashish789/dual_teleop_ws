@@ -10,13 +10,13 @@ import mediapipe as mp
 import numpy as np
 import tf2_ros
 from tf2_ros import TransformException
-
 from rclpy.action import ActionClient
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstraint
 from builtin_interfaces.msg import Duration
 from shape_msgs.msg import SolidPrimitive
 from geometry_msgs.msg import Pose as GeoPose
+import time
 
 
 class TeleopNode(Node):
@@ -37,7 +37,14 @@ class TeleopNode(Node):
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.5)
 
+        self.last_publish_time = time.time()
+        self.publish_interval = 2.0  # seconds between target updates
+
     def image_callback(self, msg: Image):
+        current_time = time.time()
+        if current_time - self.last_publish_time < self.publish_interval:
+            return
+
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
@@ -53,26 +60,39 @@ class TeleopNode(Node):
                 controlling_arm = "left_panda_arm" if label == "Right" else "right_panda_arm"
                 ee_frame = "left_panda_hand" if controlling_arm == "left_panda_arm" else "right_panda_hand"
 
-                # Use Y (up/down) and Z (depth) based on landmarks
                 avg_y = np.mean([lm.y for lm in hand_landmarks.landmark])
-                avg_z = np.mean([lm.z for lm in hand_landmarks.landmark])  # z is relative to wrist (negative = toward camera)
+                avg_z = np.mean([lm.z for lm in hand_landmarks.landmark])  # Negative is toward camera
 
                 base_y_offset = -1.5 if controlling_arm == "left_panda_arm" else 1.5
 
                 target_pose = PoseStamped()
                 target_pose.header.frame_id = 'world'
-                target_pose.pose.position.x = 0.5  # Fixed X for simplicity
-                target_pose.pose.position.y = base_y_offset + (0.5 - avg_y) * 0.4  # Invert Y
-                target_pose.pose.position.z = 0.3 + (-avg_z) * 0.2  # Convert z from camera frame (approx)
 
-                # Identity orientation (no rotation)
+                # Use Y/Z from hand; get current X from TF
+                try:
+                    tf: TransformStamped = self.tf_buffer.lookup_transform(
+                        'world',
+                        ee_frame,
+                        rclpy.time.Time(),
+                        timeout=rclpy.duration.Duration(seconds=1.0)
+                    )
+                    target_pose.pose.position.x = tf.transform.translation.x
+                except TransformException as ex:
+                    self.get_logger().warn(f'Could not get current X from TF: {ex}')
+                    target_pose.pose.position.x = 0.5  # fallback
+
+                target_pose.pose.position.y = base_y_offset + (0.5 - avg_y) * 0.4
+                target_pose.pose.position.z = 0.3 + (-avg_z) * 0.2
+
+                # Fixed orientation
                 target_pose.pose.orientation.x = 0.0
                 target_pose.pose.orientation.y = 0.0
                 target_pose.pose.orientation.z = 0.0
                 target_pose.pose.orientation.w = 1.0
 
-                print(f"[{controlling_arm.upper()}] Target → Y: {target_pose.pose.position.y:.2f}, "
-                      f"Z: {target_pose.pose.position.z:.2f}")
+                # Debug output
+                print(f"[{controlling_arm.upper()}] Target Pose → X: {target_pose.pose.position.x:.3f}, "
+                      f"Y: {target_pose.pose.position.y:.3f}, Z: {target_pose.pose.position.z:.3f}")
 
                 if controlling_arm == "left_panda_arm":
                     self.left_pose_pub.publish(target_pose)
@@ -80,6 +100,7 @@ class TeleopNode(Node):
                     self.right_pose_pub.publish(target_pose)
 
                 self.send_move_group_goal(controlling_arm, ee_frame, target_pose)
+                self.last_publish_time = time.time()
 
         cv2.imshow("Teleoperation View", cv_image)
         cv2.waitKey(1)
@@ -106,12 +127,13 @@ class TeleopNode(Node):
         current_pose.position.z = tf.transform.translation.z
         current_pose.orientation = target_pose.pose.orientation
 
+        # Interpolate steps
         steps = 10
         poses = []
         for i in range(1, steps + 1):
             ratio = i / steps
             interp = GeoPose()
-            interp.position.x = current_pose.position.x + ratio * (target_pose.pose.position.x - current_pose.position.x)
+            interp.position.x = current_pose.position.x
             interp.position.y = current_pose.position.y + ratio * (target_pose.pose.position.y - current_pose.position.y)
             interp.position.z = current_pose.position.z + ratio * (target_pose.pose.position.z - current_pose.position.z)
             interp.orientation = target_pose.pose.orientation
@@ -140,9 +162,9 @@ class TeleopNode(Node):
             orientation_constraint.header.frame_id = target_pose.header.frame_id
             orientation_constraint.link_name = ee_frame
             orientation_constraint.orientation = pose.orientation
-            orientation_constraint.absolute_x_axis_tolerance = 0.1
-            orientation_constraint.absolute_y_axis_tolerance = 0.1
-            orientation_constraint.absolute_z_axis_tolerance = 0.1
+            orientation_constraint.absolute_x_axis_tolerance = 0.2
+            orientation_constraint.absolute_y_axis_tolerance = 0.2
+            orientation_constraint.absolute_z_axis_tolerance = 0.2
             orientation_constraint.weight = 1.0
 
             constraints = Constraints()
@@ -151,6 +173,7 @@ class TeleopNode(Node):
             goal_msg.request.goal_constraints.append(constraints)
 
             self.move_group_client.send_goal_async(goal_msg)
+
 
 def main(args=None):
     rclpy.init(args=args)
