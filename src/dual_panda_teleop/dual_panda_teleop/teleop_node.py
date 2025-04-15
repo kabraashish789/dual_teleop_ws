@@ -62,11 +62,11 @@ class TeleopNode(Node):
         if results.multi_hand_landmarks and results.multi_handedness:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
                 label = handedness.classification[0].label
-                controlling_arm = "left_panda_arm" if label == "Right" else "right_panda_arm"
-                ee_frame = "left_panda_hand" if controlling_arm == "left_panda_arm" else "right_panda_hand"
-                key = 'left' if controlling_arm == "left_panda_arm" else 'right'
+                # HIGHLIGHTED FIX: Update to ensure correct arm and gripper pairing
+                controlling_arm = "right_panda_arm" if label == "Left" else "left_panda_arm"
+                ee_frame = "right_panda_hand" if controlling_arm == "right_panda_arm" else "left_panda_hand"
+                key = 'left' if controlling_arm == "right_panda_arm" else 'right'
 
-                # Smooth hand landmark positions
                 avg_y = np.mean([lm.y for lm in hand_landmarks.landmark])
                 avg_z = np.mean([lm.z for lm in hand_landmarks.landmark])
                 self.hand_pos_buffer[key].append((avg_y, avg_z))
@@ -77,11 +77,9 @@ class TeleopNode(Node):
 
                 base_y_offset = -1.5 if controlling_arm == "left_panda_arm" else 1.5
 
-                # Create pose message
                 target_pose = PoseStamped()
                 target_pose.header.frame_id = 'world'
 
-                # Get current X from TF
                 try:
                     tf: TransformStamped = self.tf_buffer.lookup_transform('world', ee_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=1.0))
                     target_pose.pose.position.x = tf.transform.translation.x
@@ -89,18 +87,15 @@ class TeleopNode(Node):
                     self.get_logger().warn(f"TF lookup failed for {ee_frame}: {ex}")
                     target_pose.pose.position.x = 0.5
 
-                # Set Y and Z from hand smoothing
-                target_pose.pose.position.y = base_y_offset + (0.5 - smooth_y) * 1.0
-                target_pose.pose.position.z = max(0.1, 1.0 + (-smooth_z) * 1.0)
+                target_pose.pose.position.y = base_y_offset + (0.5 - smooth_y) * 0.7
+                target_pose.pose.position.z = max(0.1, 1.0 + (-smooth_z) * 0.7)
 
-                # Add rotation about Z-axis based on wrist–index finger direction
                 wrist = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
                 index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
                 dx = index_tip.x - wrist.x
                 dy = index_tip.y - wrist.y
-                angle_z = math.atan2(dy, dx)  # Get angle in radians
+                angle_z = math.atan2(dy, dx)
 
-                # Convert Z rotation to quaternion
                 target_pose.pose.orientation.x = 0.0
                 target_pose.pose.orientation.y = 0.0
                 target_pose.pose.orientation.z = math.sin(angle_z / 2.0)
@@ -108,7 +103,6 @@ class TeleopNode(Node):
 
                 print(f"[{controlling_arm.upper()}] Target Pose → X: {target_pose.pose.position.x:.3f}, Y: {target_pose.pose.position.y:.3f}, Z: {target_pose.pose.position.z:.3f}, AngleZ(rad): {angle_z:.2f}")
 
-                # Publish and send motion command
                 if controlling_arm == "left_panda_arm":
                     self.left_pose_pub.publish(target_pose)
                 else:
@@ -116,12 +110,12 @@ class TeleopNode(Node):
 
                 self.send_move_group_goal(controlling_arm, ee_frame, target_pose)
 
-                # Gripper gesture
                 is_fist = self.is_fist(hand_landmarks)
                 self.fist_buffer[label].append(is_fist)
                 if len(self.fist_buffer[label]) > self.smooth_window:
                     self.fist_buffer[label].pop(0)
                 smoothed_fist = np.mean(self.fist_buffer[label]) > 0.5
+                # HIGHLIGHTED FIX: Match gripper side with same side hand
                 self.handle_gripper(label, smoothed_fist)
 
         cv2.imshow("Teleoperation View", cv_image)
@@ -140,13 +134,14 @@ class TeleopNode(Node):
     def handle_gripper(self, hand_label, is_fist):
         state = 'Closed' if is_fist else 'Open'
         position = 0.0 if is_fist else 0.0115
-        client = self.left_gripper_client if hand_label == 'Right' else self.right_gripper_client
+        # HIGHLIGHTED FIX: Hand label now controls the same-side gripper
+        client = self.right_gripper_client if hand_label == 'Left' else self.left_gripper_client
         last_state = self.last_gripper_state[hand_label]
 
         if last_state != state:
             self.send_gripper_command(client, position)
             self.last_gripper_state[hand_label] = state
-            self.get_logger().info(f"{hand_label} hand → Gripper {state}")
+            self.get_logger().info(f"Right hand → Gripper {state}") if hand_label == 'Left' else self.get_logger().info(f"Left hand → Gripper {state}")    
 
     def send_gripper_command(self, client, position):
         if not client.wait_for_server(timeout_sec=2.0):
@@ -162,14 +157,12 @@ class TeleopNode(Node):
             self.get_logger().error("MoveGroup action server not available!")
             return
 
-        # Create goal message with position + orientation constraints
         goal_msg = MoveGroup.Goal()
         goal_msg.request.group_name = group_name
         goal_msg.request.num_planning_attempts = 3
         goal_msg.request.allowed_planning_time = 3.0
         goal_msg.request.start_state.is_diff = True
 
-        # Define position constraint
         pos_constraint = PositionConstraint()
         pos_constraint.header.frame_id = target_pose.header.frame_id
         pos_constraint.link_name = ee_frame
@@ -180,14 +173,13 @@ class TeleopNode(Node):
         pos_constraint.constraint_region.primitive_poses.append(target_pose.pose)
         pos_constraint.weight = 1.0
 
-        # Orientation constraint from Z-angle
         orientation_constraint = OrientationConstraint()
         orientation_constraint.header.frame_id = target_pose.header.frame_id
         orientation_constraint.link_name = ee_frame
         orientation_constraint.orientation = target_pose.pose.orientation
-        orientation_constraint.absolute_x_axis_tolerance = 0.3
-        orientation_constraint.absolute_y_axis_tolerance = 0.3
-        orientation_constraint.absolute_z_axis_tolerance = 0.3
+        orientation_constraint.absolute_x_axis_tolerance = 0.1
+        orientation_constraint.absolute_y_axis_tolerance = 0.1
+        orientation_constraint.absolute_z_axis_tolerance = 0.1
         orientation_constraint.weight = 1.0
 
         constraints = Constraints()
@@ -195,7 +187,6 @@ class TeleopNode(Node):
         constraints.orientation_constraints.append(orientation_constraint)
         goal_msg.request.goal_constraints.append(constraints)
 
-        # Send to MoveGroup
         self.move_group_client.send_goal_async(goal_msg)
 
 def main(args=None):
