@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'teleop_node = dual_panda_teleop.teleop_node:main',
+            'teleop_trajectory = dual_panda_teleop.teleop_joint_trajectory_publisher:main',
         ],
     },
 )
