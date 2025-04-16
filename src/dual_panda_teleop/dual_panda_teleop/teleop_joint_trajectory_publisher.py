@@ -2,12 +2,16 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from sensor_msgs.msg import Image
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from control_msgs.action import GripperCommand
 from cv_bridge import CvBridge
 import cv2
 import mediapipe as mp
 import numpy as np
+import math
+
 
 class JointTrajectoryTeleopNode(Node):
     def __init__(self):
@@ -17,6 +21,13 @@ class JointTrajectoryTeleopNode(Node):
         self.left_traj_pub = self.create_publisher(JointTrajectory, '/left_panda_arm_controller/joint_trajectory', 10)
         self.right_traj_pub = self.create_publisher(JointTrajectory, '/right_panda_arm_controller/joint_trajectory', 10)
 
+        # Gripper action clients
+        self.left_gripper_client = ActionClient(self, GripperCommand, '/left_panda_arm_gripper_controller/gripper_cmd')
+        self.right_gripper_client = ActionClient(self, GripperCommand, '/right_panda_arm_gripper_controller/gripper_cmd')
+
+        # Track last gripper state to avoid duplicate commands
+        self.last_gripper_state = {'Left': None, 'Right': None}
+
         # Camera subscriber
         self.image_sub = self.create_subscription(Image, '/image_raw', self.image_callback, 10)
         self.bridge = CvBridge()
@@ -25,12 +36,34 @@ class JointTrajectoryTeleopNode(Node):
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.6)
 
-        # Position buffers
+        # [L-j1, L-j4, R-j1, R-j4, L-j6, R-j6]
+        self.current_positions = [0.0, -2.356, 0.0, -2.356, 1.571, 1.571]
         self.prev_positions = {'Left': None, 'Right': None}
-        self.current_positions = [0.0, -2.356, 0.0, -2.356, 1.571, 1.571]  # [L-j1, L-j4, R-j1, R-j4, L-j6, R-j6]
 
     def clamp(self, val, min_val, max_val):
         return max(min(val, max_val), min_val)
+
+    def is_fist(self, landmarks):
+        wrist = landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
+        tip_ids = [
+            self.mp_hands.HandLandmark.INDEX_FINGER_TIP,
+            self.mp_hands.HandLandmark.MIDDLE_FINGER_TIP,
+            self.mp_hands.HandLandmark.RING_FINGER_TIP,
+            self.mp_hands.HandLandmark.PINKY_TIP
+        ]
+        distances = [math.hypot(landmarks.landmark[tip].x - wrist.x,
+                                landmarks.landmark[tip].y - wrist.y) for tip in tip_ids]
+        avg_dist = sum(distances) / len(distances)
+        return avg_dist < 0.1
+
+    def send_gripper_command(self, client, position):
+        if not client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().warn("Gripper action server not available.")
+            return
+        goal = GripperCommand.Goal()
+        goal.command.position = position
+        goal.command.max_effort = 5.0
+        client.send_goal_async(goal)
 
     def image_callback(self, msg: Image):
         try:
@@ -53,30 +86,40 @@ class JointTrajectoryTeleopNode(Node):
                 if prev is not None:
                     delta = current_pos - prev
 
-                    # Adjust gains
+                    # Gains
                     H_GAIN = 2.0
                     V_GAIN = 2.0
-                    R_GAIN = -2.0  # rotation gain for joint6
+                    R_GAIN = -2.0  # wrist rotation sensitivity
 
-                    # Wrist and index tip
+                    # Wrist angle for joint6 control
                     wrist = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
                     index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
                     dx = index_tip.x - wrist.x
                     dy = index_tip.y - wrist.y
                     angle = np.arctan2(dy, dx)
+                    rotation_value = angle * R_GAIN
 
                     if label == 'Left':
                         self.current_positions[0] += delta[0] * H_GAIN
                         self.current_positions[1] += -delta[1] * V_GAIN
-                        self.current_positions.append(0.0) if len(self.current_positions) < 6 else None
-                        self.current_positions[4] = angle * R_GAIN  # left_panda_joint6
+                        self.current_positions[4] = rotation_value
                     elif label == 'Right':
                         self.current_positions[2] += delta[0] * H_GAIN
                         self.current_positions[3] += -delta[1] * V_GAIN
-                        self.current_positions.append(0.0) if len(self.current_positions) < 6 else None
-                        self.current_positions[5] = angle * R_GAIN  # right_panda_joint6
+                        self.current_positions[5] = rotation_value
 
                 self.prev_positions[label] = current_pos
+
+                # Gripper logic
+                gripper_client = self.left_gripper_client if label == 'Left' else self.right_gripper_client
+                is_hand_closed = self.is_fist(hand_landmarks)
+                state_str = 'Closed' if is_hand_closed else 'Open'
+                position = 0.0 if is_hand_closed else 0.0350  # close vs open position
+
+                if self.last_gripper_state[label] != state_str:
+                    self.send_gripper_command(gripper_client, position)
+                    self.last_gripper_state[label] = state_str
+                    self.get_logger().info(f"{label} hand → Gripper {state_str}")
 
         # Clamp joint limits
         self.current_positions[0] = self.clamp(self.current_positions[0], -2.896, 2.896)  # L-j1
@@ -87,6 +130,7 @@ class JointTrajectoryTeleopNode(Node):
         self.current_positions[5] = self.clamp(self.current_positions[5], -0.017, 3.752)  # R-j6
 
         self.publish_trajectories()
+
         cv2.imshow("Teleoperation View", cv_image)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             self.get_logger().info("Exiting Teleop")
@@ -107,18 +151,17 @@ class JointTrajectoryTeleopNode(Node):
         ]
         left_point = JointTrajectoryPoint()
         left_point.positions = [
-            self.current_positions[0],  # joint1 (controlled)
-            -0.785,                     # joint2
-            0.0,                        # joint3
-            self.current_positions[1], # joint4 (controlled)
-            0.0,                        # joint5
-            self.current_positions[4],  # joint6
-            0.785                      # joint7
+            self.current_positions[0],
+            -0.785,
+            0.0,
+            self.current_positions[1],
+            0.0,
+            self.current_positions[4],
+            0.785
         ]
         left_point.time_from_start.sec = 1
         left_traj.points.append(left_point)
         self.left_traj_pub.publish(left_traj)
-        # Print left arm joint positions
         self.get_logger().info(f"[LEFT ARM] Sent trajectory:\n" +
             "\n".join([f"  {name}: {pos:.3f}" for name, pos in zip(left_traj.joint_names, left_point.positions)]))
 
@@ -146,9 +189,9 @@ class JointTrajectoryTeleopNode(Node):
         right_point.time_from_start.sec = 1
         right_traj.points.append(right_point)
         self.right_traj_pub.publish(right_traj)
-        # Print right arm joint positions
         self.get_logger().info(f"[RIGHT ARM] Sent trajectory:\n" +
             "\n".join([f"  {name}: {pos:.3f}" for name, pos in zip(right_traj.joint_names, right_point.positions)]))
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -160,6 +203,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         cv2.destroyAllWindows()
+
 
 if __name__ == '__main__':
     main()
