@@ -25,7 +25,6 @@ class JointTrajectoryTeleopNode(Node):
         self.left_gripper_client = ActionClient(self, GripperCommand, '/left_panda_arm_gripper_controller/gripper_cmd')
         self.right_gripper_client = ActionClient(self, GripperCommand, '/right_panda_arm_gripper_controller/gripper_cmd')
 
-        # Track last gripper state to avoid duplicate commands
         self.last_gripper_state = {'Left': None, 'Right': None}
 
         # Camera subscriber
@@ -36,9 +35,12 @@ class JointTrajectoryTeleopNode(Node):
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.6)
 
-        # [L-j1, L-j4, R-j1, R-j4, L-j6, R-j6]
+        # Joint positions: [L-j1, L-j4, R-j1, R-j4, L-j6, R-j6]
         self.current_positions = [0.0, -2.356, 0.0, -2.356, 1.571, 1.571]
-        self.prev_positions = {'Left': None, 'Right': None}
+
+        # Smoothing buffers
+        self.position_buffer = {'Left': [], 'Right': []}
+        self.window_size = 5  # moving average window
 
     def clamp(self, val, min_val, max_val):
         return max(min(val, max_val), min_val)
@@ -78,13 +80,20 @@ class JointTrajectoryTeleopNode(Node):
         if results.multi_hand_landmarks and results.multi_handedness:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
                 label = handedness.classification[0].label  # 'Left' or 'Right'
-                x = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST].x
-                y = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST].y
-                current_pos = np.array([x, y])
+                wrist_x = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST].x
+                wrist_y = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST].y
+                current_pos = np.array([wrist_x, wrist_y])
 
-                prev = self.prev_positions[label]
-                if prev is not None:
-                    delta = current_pos - prev
+                # Update buffer
+                self.position_buffer[label].append(current_pos)
+                if len(self.position_buffer[label]) > self.window_size:
+                    self.position_buffer[label].pop(0)
+
+                # Compute smoothed delta
+                if len(self.position_buffer[label]) >= 2:
+                    prev_avg = np.mean(self.position_buffer[label][:-1], axis=0)
+                    curr_avg = np.mean(self.position_buffer[label], axis=0)
+                    delta = curr_avg - prev_avg
 
                     # Gains
                     H_GAIN = 2.0
@@ -108,13 +117,11 @@ class JointTrajectoryTeleopNode(Node):
                         self.current_positions[3] += -delta[1] * V_GAIN
                         self.current_positions[5] = rotation_value
 
-                self.prev_positions[label] = current_pos
-
                 # Gripper logic
                 gripper_client = self.left_gripper_client if label == 'Left' else self.right_gripper_client
                 is_hand_closed = self.is_fist(hand_landmarks)
                 state_str = 'Closed' if is_hand_closed else 'Open'
-                position = 0.0 if is_hand_closed else 0.0350  # close vs open position
+                position = 0.0 if is_hand_closed else 0.0350
 
                 if self.last_gripper_state[label] != state_str:
                     self.send_gripper_command(gripper_client, position)
@@ -138,59 +145,37 @@ class JointTrajectoryTeleopNode(Node):
             cv2.destroyAllWindows()
 
     def publish_trajectories(self):
-        # Left arm trajectory
         left_traj = JointTrajectory()
         left_traj.joint_names = [
-            'left_panda_joint1',
-            'left_panda_joint2',
-            'left_panda_joint3',
-            'left_panda_joint4',
-            'left_panda_joint5',
-            'left_panda_joint6',
-            'left_panda_joint7'
+            'left_panda_joint1', 'left_panda_joint2', 'left_panda_joint3',
+            'left_panda_joint4', 'left_panda_joint5', 'left_panda_joint6', 'left_panda_joint7'
         ]
         left_point = JointTrajectoryPoint()
         left_point.positions = [
-            self.current_positions[0],
-            -0.785,
-            0.0,
-            self.current_positions[1],
-            0.0,
-            self.current_positions[4],
-            0.785
+            self.current_positions[0], -0.785, 0.0,
+            self.current_positions[1], 0.0, self.current_positions[4], 0.785
         ]
         left_point.time_from_start.sec = 1
         left_traj.points.append(left_point)
         self.left_traj_pub.publish(left_traj)
         self.get_logger().info(f"[LEFT ARM] Sent trajectory:\n" +
-            "\n".join([f"  {name}: {pos:.3f}" for name, pos in zip(left_traj.joint_names, left_point.positions)]))
+                               "\n".join([f"  {n}: {p:.3f}" for n, p in zip(left_traj.joint_names, left_point.positions)]))
 
-        # Right arm trajectory
         right_traj = JointTrajectory()
         right_traj.joint_names = [
-            'right_panda_joint1',
-            'right_panda_joint2',
-            'right_panda_joint3',
-            'right_panda_joint4',
-            'right_panda_joint5',
-            'right_panda_joint6',
-            'right_panda_joint7'
+            'right_panda_joint1', 'right_panda_joint2', 'right_panda_joint3',
+            'right_panda_joint4', 'right_panda_joint5', 'right_panda_joint6', 'right_panda_joint7'
         ]
         right_point = JointTrajectoryPoint()
         right_point.positions = [
-            self.current_positions[2],
-            -0.785,
-            0.0,
-            self.current_positions[3],
-            0.0,
-            self.current_positions[5],
-            0.785
+            self.current_positions[2], -0.785, 0.0,
+            self.current_positions[3], 0.0, self.current_positions[5], 0.785
         ]
         right_point.time_from_start.sec = 1
         right_traj.points.append(right_point)
         self.right_traj_pub.publish(right_traj)
         self.get_logger().info(f"[RIGHT ARM] Sent trajectory:\n" +
-            "\n".join([f"  {name}: {pos:.3f}" for name, pos in zip(right_traj.joint_names, right_point.positions)]))
+                               "\n".join([f"  {n}: {p:.3f}" for n, p in zip(right_traj.joint_names, right_point.positions)]))
 
 
 def main(args=None):
@@ -207,5 +192,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
 
